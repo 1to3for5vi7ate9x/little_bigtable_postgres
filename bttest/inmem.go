@@ -1057,6 +1057,7 @@ func applyMutations(tbl *table, r *row, muts []*btpb.Mutation, fs map[string]*co
 				}
 				if len(cs) == 0 {
 					delete(r.families[fam].Cells, col)
+					r.families[fam].ensureColNamesSorted() // sort.Search below requires sorted ColNames
 					colNames := r.families[fam].ColNames
 					i := sort.Search(len(colNames), func(i int) bool { return colNames[i] >= col })
 					if i < len(colNames) && colNames[i] == col {
@@ -1075,6 +1076,11 @@ func applyMutations(tbl *table, r *row, muts []*btpb.Mutation, fs map[string]*co
 			fampre := mut.DeleteFromFamily.FamilyName
 			delete(r.families, fampre)
 		}
+	}
+	// Restore the sorted-ColNames invariant once, after all mutations are applied,
+	// so the persisted row (and every later read) sees sorted column names.
+	for _, f := range r.families {
+		f.ensureColNamesSorted()
 	}
 	return nil
 }
@@ -1181,6 +1187,15 @@ func (s *server) ReadModifyWriteRow(ctx context.Context, req *btpb.ReadModifyWri
 		if _, ok := cfs[f]; !ok {
 			delete(r.families, f)
 		}
+	}
+	// This path appends columns via cellsByColumn without going through
+	// applyMutations, so restore the sorted-ColNames invariant before persist
+	// and before building the (column-ordered) response.
+	for _, f := range r.families {
+		f.ensureColNamesSorted()
+	}
+	for _, f := range resultRow.families {
+		f.ensureColNamesSorted()
 	}
 	tbl.rows.ReplaceOrInsert(r)
 
@@ -1503,6 +1518,13 @@ type family struct {
 	Order    uint64            // Creation order of column family
 	ColNames []string          // Column names are sorted in lexicographical ascending order
 	Cells    map[string][]cell // Keyed by column name; cells are in descending timestamp order
+
+	// colNamesDirty tracks that ColNames has had columns appended without being
+	// re-sorted. Unexported so msgpack does not serialize it (reset to false on
+	// reload, where stored ColNames is already sorted). See cellsByColumn /
+	// ensureColNamesSorted: sorting once per mutation batch instead of on every
+	// inserted column turns O(N^2 log N) into O(N log N) for wide rows.
+	colNamesDirty bool
 }
 
 type byCreationOrder []*family
@@ -1515,10 +1537,22 @@ func (b byCreationOrder) Less(i, j int) bool { return b[i].Order < b[j].Order }
 // and returns all cells within a column
 func (f *family) cellsByColumn(name string) []cell {
 	if _, ok := f.Cells[name]; !ok {
+		// Append only; defer the (single) sort to ensureColNamesSorted so that
+		// inserting M new columns is O(M) appends + one O(M log M) sort rather
+		// than an O(M log M) sort per column (O(M^2 log M) total).
 		f.ColNames = append(f.ColNames, name)
-		sort.Strings(f.ColNames)
+		f.colNamesDirty = true
 	}
 	return f.Cells[name]
+}
+
+// ensureColNamesSorted restores the lexicographically-sorted invariant of
+// ColNames if columns were appended via cellsByColumn since the last sort.
+func (f *family) ensureColNamesSorted() {
+	if f.colNamesDirty {
+		sort.Strings(f.ColNames)
+		f.colNamesDirty = false
+	}
 }
 
 type cell struct {
