@@ -49,6 +49,7 @@ import (
 	"github.com/google/btree"
 	"github.com/jmoiron/sqlx"
 	"github.com/sirupsen/logrus"
+	"github.com/vmihailenco/msgpack/v5"
 	btapb "google.golang.org/genproto/googleapis/bigtable/admin/v2"
 	btpb "google.golang.org/genproto/googleapis/bigtable/v2"
 	"google.golang.org/genproto/googleapis/longrunning"
@@ -56,6 +57,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"rsc.io/binaryregexp"
 )
 
@@ -887,8 +889,32 @@ func (s *server) MutateRows(req *btpb.MutateRowsRequest, stream btpb.Bigtable_Mu
 
 	cfs := tbl.columnFamilies()
 
+	// Batch-load existing rows for every entry key in one round-trip, then upsert
+	// all mutated rows in a single batched transaction. This replaces 2*N serial
+	// SQL queries (a Get + an Insert per entry) — the per-slot Hoodi-scale hot path.
+	// Multiple entries may target the SAME row key; they must accumulate into one
+	// row object (a single upsert per key) — otherwise the batched ON CONFLICT
+	// statement would try to update the same row twice (SQLSTATE 21000).
+	keys := make([]string, len(req.Entries))
 	for i, entry := range req.Entries {
-		r := tbl.mutableRow(string(entry.RowKey))
+		keys[i] = string(entry.RowKey)
+	}
+	existing := tbl.rows.GetBatch(keys)
+
+	rowByKey := make(map[string]*row, len(req.Entries))
+	order := make([]string, 0, len(req.Entries))
+	for i, entry := range req.Entries {
+		key := string(entry.RowKey)
+		r, seen := rowByKey[key]
+		if !seen {
+			if ex, ok := existing[key]; ok && ex != nil {
+				r = ex
+			} else {
+				r = newRow(key)
+			}
+			rowByKey[key] = r
+			order = append(order, key)
+		}
 		code, msg := int32(codes.OK), ""
 		if err := applyMutations(tbl, r, entry.Mutations, cfs); err != nil {
 			code = int32(codes.Internal)
@@ -898,15 +924,21 @@ func (s *server) MutateRows(req *btpb.MutateRowsRequest, stream btpb.Bigtable_Mu
 			Index:  int64(i),
 			Status: &statpb.Status{Code: code, Message: msg},
 		}
+	}
+
+	toWrite := make([]*row, 0, len(order))
+	for _, key := range order {
+		r := rowByKey[key]
 		r.gc(tbl.gcRules())
-		// JIT family deletion; could be skipped if mutableRow doesn't return an existing row
+		// JIT family deletion
 		for f := range r.families {
 			if _, ok := cfs[f]; !ok {
 				delete(r.families, f)
 			}
 		}
-		tbl.rows.ReplaceOrInsert(r)
+		toWrite = append(toWrite, r)
 	}
+	tbl.rows.ReplaceOrInsertBatch(toWrite)
 	return stream.Send(res)
 }
 
@@ -1505,6 +1537,58 @@ type columnFamily struct {
 	Name   string
 	Order  uint64 // Creation order of column family
 	GCRule *btapb.GcRule
+}
+
+// EncodeMsgpack/DecodeMsgpack provide explicit msgpack serialization for
+// columnFamily. The default reflection-based path cannot round-trip GCRule
+// (a protobuf message with a oneof), so it is serialized via proto.Marshal.
+// Without this, the emulator panics on restart when LoadTables decodes the
+// persisted table metadata (tables_t). Encoded as [Name, Order, gcRuleBytes].
+func (c *columnFamily) EncodeMsgpack(enc *msgpack.Encoder) error {
+	var gcBytes []byte
+	if c.GCRule != nil {
+		b, err := proto.Marshal(c.GCRule)
+		if err != nil {
+			return err
+		}
+		gcBytes = b
+	}
+	if err := enc.EncodeArrayLen(3); err != nil {
+		return err
+	}
+	if err := enc.EncodeString(c.Name); err != nil {
+		return err
+	}
+	if err := enc.EncodeUint(c.Order); err != nil {
+		return err
+	}
+	return enc.EncodeBytes(gcBytes)
+}
+
+func (c *columnFamily) DecodeMsgpack(dec *msgpack.Decoder) error {
+	n, err := dec.DecodeArrayLen()
+	if err != nil {
+		return err
+	}
+	if n != 3 {
+		return fmt.Errorf("columnFamily: unexpected msgpack array len %d", n)
+	}
+	if c.Name, err = dec.DecodeString(); err != nil {
+		return err
+	}
+	if c.Order, err = dec.DecodeUint64(); err != nil {
+		return err
+	}
+	gcBytes, err := dec.DecodeBytes()
+	if err != nil {
+		return err
+	}
+	if len(gcBytes) > 0 {
+		c.GCRule = &btapb.GcRule{}
+		return proto.Unmarshal(gcBytes, c.GCRule)
+	}
+	c.GCRule = nil
+	return nil
 }
 
 func (c *columnFamily) proto() *btapb.ColumnFamily {

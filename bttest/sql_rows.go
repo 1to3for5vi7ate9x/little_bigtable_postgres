@@ -3,6 +3,7 @@ package bttest
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -221,4 +222,114 @@ func (db *SqlRows) ReplaceOrInsert(item Item) Item {
 		logrus.Fatalf("row:%s err %s", row.key, err)
 	}
 	return row
+}
+
+// GetBatch loads the existing rows for the given keys in a single round-trip
+// (chunked to stay under the postgres parameter limit). Missing keys are simply
+// absent from the returned map. No per-row logging — this is a hot path.
+func (db *SqlRows) GetBatch(keys []string) map[string]*row {
+	result := make(map[string]*row, len(keys))
+	if len(keys) == 0 {
+		return result
+	}
+	const chunk = 1000
+	for start := 0; start < len(keys); start += chunk {
+		end := start + chunk
+		if end > len(keys) {
+			end = len(keys)
+		}
+		batch := keys[start:end]
+		var sb strings.Builder
+		sb.WriteString("SELECT row_key, families FROM rows_t WHERE parent = $1 AND table_id = $2 AND row_key IN (")
+		args := make([]interface{}, 0, len(batch)+2)
+		args = append(args, db.parent, db.tableId)
+		for i, k := range batch {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString(fmt.Sprintf("$%d", i+3))
+			args = append(args, k)
+		}
+		sb.WriteString(")")
+		rows, err := db.db.Query(sb.String(), args...)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			logrus.Fatal(err)
+		}
+		for rows.Next() {
+			var r row
+			if err := rows.Scan(&r.key, &r); err != nil {
+				rows.Close()
+				logrus.Fatal(err)
+			}
+			result[r.key] = &r
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			logrus.Fatal(err)
+		}
+		rows.Close()
+	}
+	return result
+}
+
+// ReplaceOrInsertBatch upserts all given rows in chunked multi-row INSERTs within
+// a single transaction — replacing N individual INSERTs (the per-slot hot path).
+func (db *SqlRows) ReplaceOrInsertBatch(rows []*row) {
+	if len(rows) == 0 {
+		return
+	}
+	// Defensive de-dup: a single multi-row upsert may not reference the same
+	// conflict key twice (postgres SQLSTATE 21000). Keep the last occurrence.
+	seen := make(map[string]int, len(rows))
+	deduped := make([]*row, 0, len(rows))
+	for _, r := range rows {
+		if idx, ok := seen[r.key]; ok {
+			deduped[idx] = r
+			continue
+		}
+		seen[r.key] = len(deduped)
+		deduped = append(deduped, r)
+	}
+	rows = deduped
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tx, err := db.db.Beginx()
+	if err != nil {
+		logrus.Fatal(err)
+	}
+	const chunk = 1000
+	for start := 0; start < len(rows); start += chunk {
+		end := start + chunk
+		if end > len(rows) {
+			end = len(rows)
+		}
+		batch := rows[start:end]
+		var sb strings.Builder
+		sb.WriteString("INSERT INTO rows_t (parent, table_id, row_key, families) VALUES ")
+		args := make([]interface{}, 0, len(batch)*4)
+		for i, r := range batch {
+			families, err := r.Bytes()
+			if err != nil {
+				tx.Rollback()
+				logrus.Fatal(err)
+			}
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			base := i * 4
+			sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d)", base+1, base+2, base+3, base+4))
+			args = append(args, db.parent, db.tableId, r.key, families)
+		}
+		sb.WriteString(" ON CONFLICT (parent, table_id, row_key) DO UPDATE SET families = EXCLUDED.families")
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			tx.Rollback()
+			logrus.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		logrus.Fatal(err)
+	}
 }
