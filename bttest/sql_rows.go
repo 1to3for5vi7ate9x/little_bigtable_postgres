@@ -98,7 +98,7 @@ func (db *SqlRows) AscendGreaterOrEqual(pivot Item, iterator ItemIterator) {
 		logrus.Infof("AscendGreaterOrEqual for %s of table %s/%s completed in %v", row.key, db.parent, db.tableId, time.Since(start))
 	}()
 
-	db.query(iterator, "SELECT row_key, families FROM rows_t WHERE parent = $1 and table_id = $2 and row_key >= $3 ORDER BY row_key ASC", db.parent, db.tableId, row.key)
+	db.query(iterator, "SELECT row_key, families FROM rows_t WHERE parent = $1 and table_id = $2 and row_key >= $3 ORDER BY row_key ASC", db.parent, db.tableId, []byte(row.key))
 }
 
 func (db *SqlRows) AscendLessThan(pivot Item, iterator ItemIterator) {
@@ -110,7 +110,7 @@ func (db *SqlRows) AscendLessThan(pivot Item, iterator ItemIterator) {
 		logrus.Infof("AscendLessThan for %s of table %s/%s completed in %v", row.key, db.parent, db.tableId, time.Since(start))
 	}()
 
-	db.query(iterator, "SELECT row_key, families FROM rows_t WHERE parent = $1 and table_id = $2 and row_key < $3 ORDER BY row_key ASC", db.parent, db.tableId, row.key)
+	db.query(iterator, "SELECT row_key, families FROM rows_t WHERE parent = $1 and table_id = $2 and row_key < $3 ORDER BY row_key ASC", db.parent, db.tableId, []byte(row.key))
 }
 
 func (db *SqlRows) AscendRange(greaterOrEqual, lessThan Item, iterator ItemIterator) {
@@ -123,7 +123,7 @@ func (db *SqlRows) AscendRange(greaterOrEqual, lessThan Item, iterator ItemItera
 		logrus.Infof("AscendRange for %s/%s of table %s/%s completed in %v", ge.key, lt.key, db.parent, db.tableId, time.Since(start))
 	}()
 
-	db.query(iterator, "SELECT row_key, families FROM rows_t WHERE parent = $1 and table_id = $2 and row_key >= $3 and row_key < $4 ORDER BY row_key ASC", db.parent, db.tableId, ge.key, lt.key)
+	db.query(iterator, "SELECT row_key, families FROM rows_t WHERE parent = $1 and table_id = $2 and row_key >= $3 and row_key < $4 ORDER BY row_key ASC", db.parent, db.tableId, []byte(ge.key), []byte(lt.key))
 }
 
 func (db *SqlRows) DeleteAll() {
@@ -154,7 +154,7 @@ func (db *SqlRows) Delete(item Item) {
 		logrus.Infof("Delete for %s of table %s/%s completed in %v", row.key, db.parent, db.tableId, time.Since(start))
 	}()
 
-	_, err := db.db.Exec("DELETE FROM rows_t WHERE parent = $1 and table_id = $2 and row_key = $3", db.parent, db.tableId, row.key)
+	_, err := db.db.Exec("DELETE FROM rows_t WHERE parent = $1 and table_id = $2 and row_key = $3", db.parent, db.tableId, []byte(row.key))
 	if err != nil {
 		logrus.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func (db *SqlRows) Get(key Item) Item {
 		logrus.Infof("Get for %s of table %s/%s completed in %v", row.key, db.parent, db.tableId, time.Since(start))
 	}()
 
-	err := db.db.QueryRow("SELECT families FROM rows_t WHERE parent = $1 and table_id = $2 and row_key = $3", db.parent, db.tableId, row.key).Scan(row)
+	err := db.db.QueryRow("SELECT families FROM rows_t WHERE parent = $1 and table_id = $2 and row_key = $3", db.parent, db.tableId, []byte(row.key)).Scan(row)
 	if err == sql.ErrNoRows {
 		return row
 	}
@@ -217,7 +217,7 @@ func (db *SqlRows) ReplaceOrInsert(item Item) Item {
 		logrus.Infof("ReplaceOrInsert for %s of table %s/%s completed in %v", row.key, db.parent, db.tableId, time.Since(start))
 	}()
 
-	_, err = db.db.Exec("INSERT INTO rows_t (parent, table_id, row_key, families) values ($1, $2, $3, $4) ON CONFLICT (parent, table_id, row_key) DO UPDATE SET families = EXCLUDED.families", db.parent, db.tableId, row.key, families)
+	_, err = db.db.Exec("INSERT INTO rows_t (parent, table_id, row_key, families) values ($1, $2, $3, $4) ON CONFLICT (parent, table_id, row_key) DO UPDATE SET families = EXCLUDED.families", db.parent, db.tableId, []byte(row.key), families)
 	if err != nil {
 		logrus.Fatalf("row:%s err %s", row.key, err)
 	}
@@ -248,7 +248,7 @@ func (db *SqlRows) GetBatch(keys []string) map[string]*row {
 				sb.WriteString(",")
 			}
 			sb.WriteString(fmt.Sprintf("$%d", i+3))
-			args = append(args, k)
+			args = append(args, []byte(k))
 		}
 		sb.WriteString(")")
 		rows, err := db.db.Query(sb.String(), args...)
@@ -321,7 +321,7 @@ func (db *SqlRows) ReplaceOrInsertBatch(rows []*row) {
 			}
 			base := i * 4
 			sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d)", base+1, base+2, base+3, base+4))
-			args = append(args, db.parent, db.tableId, r.key, families)
+			args = append(args, db.parent, db.tableId, []byte(r.key), families)
 		}
 		sb.WriteString(" ON CONFLICT (parent, table_id, row_key) DO UPDATE SET families = EXCLUDED.families")
 		if _, err := tx.Exec(sb.String(), args...); err != nil {
